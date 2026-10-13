@@ -219,7 +219,56 @@ typedef struct
   pam_handle_t *pamh;
 
   char         *driver;
+
+  /* the animated "Prompting id..." line */
+  bool          prompting;
+  bool          prompt_shown;
+  unsigned      dots;
+  uint64_t      next_tick;
 } verify_data;
+
+#define PROMPT_TEXT "Prompting id"
+#define PROMPT_TICK_USEC (400 * USEC_PER_MSEC)
+/* The application's conversation prints every message on its own line, so a
+ * redraw goes back up to the prompt line and clears it first (sudo, login and
+ * friends pass the text through untouched). */
+#define PROMPT_ERASE "\r\033[1A\033[2K"
+
+static void
+send_prompt (verify_data *data)
+{
+  char buf[64];
+
+  snprintf (buf, sizeof buf, "%s%s%s",
+            data->prompt_shown ? PROMPT_ERASE : "",
+            PROMPT_TEXT, "..." + (3 - data->dots));
+  send_info_msg (data->pamh, buf);
+  data->prompt_shown = true;
+  data->dots = (data->dots + 1) % 4;
+  data->next_tick = now () + PROMPT_TICK_USEC;
+}
+
+/* Any other message takes the prompt line's place; if the prompt is still
+ * running its next tick redraws on a fresh line below. */
+static void
+send_over_prompt (verify_data *data, const char *msg, int style)
+{
+  if (data->prompt_shown)
+    {
+      pf_autofree char *s = NULL;
+      size_t len = strlen (PROMPT_ERASE) + strlen (msg) + 1;
+
+      s = malloc (len);
+      if (s)
+        {
+          snprintf (s, len, "%s%s", PROMPT_ERASE, msg);
+          send_msg (data->pamh, s, style);
+          data->prompt_shown = false;
+          return;
+        }
+    }
+  send_msg (data->pamh, msg, style);
+}
 
 static void
 verify_data_free (verify_data *data)
@@ -286,7 +335,7 @@ verify_result (sd_bus_message *m,
       data->result = strdup ("Protocol error with fprintd!");
       return 0;
     }
-  send_err_msg (data->pamh, msg);
+  send_over_prompt (data, msg, PAM_ERROR_MSG);
 
   return 0;
 }
@@ -321,7 +370,10 @@ verify_finger_selected (sd_bus_message *m,
     }
   if (debug)
     pam_syslog (data->pamh, LOG_DEBUG, "verify_finger_selected %s", msg);
-  send_info_msg (data->pamh, msg);
+  data->prompting = true;
+  data->prompt_shown = false;
+  data->dots = 0;
+  send_prompt (data);
 
   return 0;
 }
@@ -544,6 +596,18 @@ do_verify (sd_bus      *bus,
             continue;
           if (data->result != NULL)
             break;
+          if (data->prompting)
+            {
+              int64_t until_tick = data->next_tick - now ();
+
+              if (until_tick <= 0)
+                {
+                  send_prompt (data);
+                  until_tick = PROMPT_TICK_USEC;
+                }
+              if (until_tick < wait_time)
+                wait_time = until_tick;
+            }
           if (r == 0)
             {
 #ifdef __linux__
@@ -575,18 +639,20 @@ do_verify (sd_bus      *bus,
             }
         }
 
+      data->prompting = false;
+
       if (data->verify_ret != FPRINTD_PAM_INCOMPLETE)
         return data->verify_ret;
 
       if (now () >= verification_end)
         {
           data->timed_out = true;
-          send_info_msg (data->pamh, _("Verification timed out"));
+          send_over_prompt (data, _("Verification timed out"), PAM_TEXT_INFO);
         }
       else
         {
           if (str_equal (data->result, "verify-no-match"))
-            send_err_msg (data->pamh, _("Failed to match fingerprint"));
+            send_over_prompt (data, _("Failed to match fingerprint"), PAM_ERROR_MSG);
           else if (str_equal (data->result, "verify-match"))
             /* Simply disconnect from bus if we return PAM_SUCCESS */
             return PAM_SUCCESS;
